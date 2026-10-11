@@ -1,6 +1,5 @@
 # AV Safety Supervisor — Autonomous Vehicle Safety Supervisor on QNX
-#Aj
-QNX eHACK 2026 · Problem statement #17 · Team NEXGEN INNOVATORS
+QNX eHACK 2026 · Problem statement #17  Team NEXGEN INNOVATORS
 
 An independent, highest-priority QNX program that checks every command of the autonomous
 navigation software against physics and its own sensors, corrects or blocks unsafe commands, and
