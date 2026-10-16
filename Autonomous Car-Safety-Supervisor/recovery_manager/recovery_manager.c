@@ -1,15 +1,18 @@
 /*
  * recovery_manager.c - executes the controlled stop (minimal risk manoeuvre) and restarts
- * a crashed or hung navigation process.
+ * a crashed or hung navigation process or a crashed sensor monitor.
  *
  * Pulses from the supervisor (never MsgSend, so no send-cycle deadlock is possible):
  *   RECOV_START (value = speed mm/s) : start the deceleration ramp
  *   RECOV_STOP                        : stop sending setpoints
  *   RESTART_NAV (value = old pid)     : kill the old nav (if hung) and spawn a new one
+ *   RESTART_SENSOR                    : spawn a new sensor monitor
  * While active it MsgSends RECOVERY_CMD setpoints to the supervisor every 20 ms. The
  * supervisor only accepts them while it is in MRM (authority = RECOVERY).
+ * A restarted process does not make the car drive again: the supervisor still needs healthy
+ * data for 2 s and an operator "ack".
  *
- * usage: recovery_manager [-s robot|car] [-n /path/to/navigation]
+ * usage: recovery_manager [-s robot|car] [-n /path/to/navigation] [-m /path/to/sensor_monitor]
  */
 #include <errno.h>
 #include <signal.h>
@@ -27,11 +30,12 @@ extern char **environ;
 
 static const av_profile_t *P;
 static const char *g_nav_path = "./navigation";
+static const char *g_sensor_path = "./sensor_monitor";
 static const char *g_profile = "robot";
 static int      g_sup = -1;
 static int      g_active;
 static float    g_v0;
-static uint64_t g_t0, g_last_restart;
+static uint64_t g_t0, g_last_restart, g_last_sensor_restart;
 static uint32_t g_seq;
 
 static void connect_supervisor(void)
@@ -66,6 +70,20 @@ static void restart_nav(int old_pid, uint64_t now)
         printf("[RECOVERY] navigation restarted (new pid %d)\n", pid);
 }
 
+static void restart_sensor_monitor(uint64_t now)
+{
+    if (now - g_last_sensor_restart < 1000000u)
+        return;
+    g_last_sensor_restart = now;
+    char *argv[] = { (char *)g_sensor_path, "-s", (char *)g_profile, NULL };
+    pid_t pid;
+    int rc = posix_spawn(&pid, g_sensor_path, NULL, NULL, argv, environ);
+    if (rc != 0)
+        printf("[RECOVERY] cannot restart sensor monitor '%s': %s\n", g_sensor_path, strerror(rc));
+    else
+        printf("[RECOVERY] sensor monitor restarted (new pid %d)\n", pid);
+}
+
 static void ramp_step(uint64_t now)
 {
     float t = (float)(now - g_t0) * 1e-6f;
@@ -93,12 +111,13 @@ static void ramp_step(uint64_t now)
 int main(int argc, char *argv[])
 {
     int opt;
-    while ((opt = getopt(argc, argv, "s:n:h")) != -1) {
+    while ((opt = getopt(argc, argv, "s:n:m:h")) != -1) {
         switch (opt) {
         case 's': g_profile = optarg; break;
         case 'n': g_nav_path = optarg; break;
+        case 'm': g_sensor_path = optarg; break;
         default:
-            fprintf(stderr, "usage: %s [-s robot|car] [-n nav_path]\n", argv[0]);
+            fprintf(stderr, "usage: %s [-s robot|car] [-n nav_path] [-m sensor_monitor_path]\n", argv[0]);
             return 1;
         }
     }
@@ -145,6 +164,9 @@ int main(int argc, char *argv[])
             break;
         case AV_PULSE_RESTART_NAV:
             restart_nav(m.pulse.value.sival_int, now);
+            break;
+        case AV_PULSE_RESTART_SENSOR:
+            restart_sensor_monitor(now);
             break;
         case _PULSE_CODE_DISCONNECT:
             ConnectDetach(m.pulse.scoid);

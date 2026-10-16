@@ -6,8 +6,10 @@
  *  - SAFE -> RECOVERY after AV_RECOVERY_CLEAR_MS without faults and with a clear path
  *  - RECOVERY -> drive again only after the operator acknowledges (CLI "ack")
  *  - authority: NAV drives in NORMAL/CAUTION/DEGRADED, RECOVERY drives in MRM, nobody otherwise
+ *  - every MRM / ESTOP starts the safe-state deadline timer (safety_deadline.c)
  */
 #include "safety_states.h"
+#include "safety_deadline.h"
 #include "decision_core.h"
 
 #define MS(x) ((uint64_t)(x) * 1000u)
@@ -38,6 +40,7 @@ static const uint8_t g_sev[C__COUNT] = {
     [C_ISLAND_TRIPPED]       = SEV_ESTOP,
     [C_ESTOP_BUTTON]         = SEV_ESTOP,
     [C_PATH_BLOCKED]         = SEV_NONE,      /* only blocks recovery */
+    [C_DEADLINE_MISSED]      = SEV_ESTOP,
 };
 
 uint8_t sm_target_severity(uint32_t conds)
@@ -109,6 +112,7 @@ static void transition(sup_ctx_t *c, av_state_t to, uint64_t now)
     }
 
     sup_emit(c, EV_STATE, (uint8_t)from, 0, 0.0f, 0.0f);
+    dl_on_state(c, from, to, now);
     if (sup_state_severity(to) > sup_state_severity(from) && from != ST_INIT)
         sup_reaction(c);
 }

@@ -103,7 +103,12 @@ static void print_status(const av_status_t *s)
     printf("Sensor health    : left wheel %s | right wheel %s | ultrasonic %s | IMU %s\n",
            health_word(s->health[SENS_ENC_L]), health_word(s->health[SENS_ENC_R]),
            health_word(s->health[SENS_US]), health_word(s->health[SENS_IMU]));
-    printf("STM32 / E-stop   : STM32 %s | emergency button %s\n",
+    if (s->sensor_pid)
+        printf("Sensor monitor   : running (pid %d), judges every sensor every %d ms\n",
+               s->sensor_pid, AV_TICK_MS);
+    else
+        printf("Sensor monitor   : NOT RUNNING (no sensor data reaches the supervisor)\n");
+    printf("Motor watchdog   : %s | emergency button %s\n",
            s->island_tripped ? "STOPPED THE MOTORS" : "ok", s->estop ? "PRESSED" : "not pressed");
     printf("--- command check ---\n");
     printf("Navigation asked : %.2f m/s, steer %.1f deg\n", s->nav_speed, s->nav_steer);
@@ -126,6 +131,16 @@ static void print_status(const av_status_t *s)
         printf("Reaction time    : last fault '%s' -> %.1f ms   (best %.1f / worst %.1f ms, %u faults)\n",
                av_fault_name((int)s->last_inject_fault), s->inject_ms_last, s->inject_ms_min,
                s->inject_ms_max, s->inject_count);
+    printf("--- safe-state deadline ---\n");
+    if (s->dl_active)
+        printf("Stop in progress : %.0f ms used of %.0f ms allowed\n", s->dl_elapsed_ms, s->dl_budget_ms);
+    if (s->dl_pass + s->dl_fail)
+        printf("Stops so far     : %u in time (PASS) | %u too late (FAIL) | last %.0f ms of %.0f ms | "
+               "slowest %.0f ms | smallest spare %.0f ms\n",
+               s->dl_pass, s->dl_fail, s->dl_elapsed_ms, s->dl_budget_ms, s->dl_worst_ms,
+               s->dl_min_margin_ms);
+    else if (!s->dl_active)
+        printf("Stops so far     : none yet\n");
     printf("===============================================================\n");
 }
 

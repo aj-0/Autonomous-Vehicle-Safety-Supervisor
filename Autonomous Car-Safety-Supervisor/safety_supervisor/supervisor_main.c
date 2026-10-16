@@ -4,12 +4,16 @@
  * One thread, SCHED_FIFO priority 50, memory locked, channel with fixed priority.
  * Everything enters through ONE channel and is handled in arrival order:
  *
- *   messages : HELLO, NAV_CMD (nav waits for our verdict), SENSOR_STATE, PERCEPTION,
- *              RECOVERY_CMD, CLI
+ *   messages : HELLO, NAV_CMD (nav waits for our verdict), SENSOR_STATE (from sensor_monitor),
+ *              PERCEPTION, RECOVERY_CMD, CLI
  *   pulses   : 10 ms TICK timer, NAV heartbeat, kernel DISCONNECT (a client process died)
  *
- * usage: safety_supervisor [-s robot|car] [-b] [-c core] [-v]
- *   -s  vehicle profile (default robot)
+ * GPIO safety outputs (settings.h): red/green LED, buzzer, inject marker, motor relay.
+ *
+ * usage: safety_supervisor [-s robot|rover|car] [-b] [-c core] [-v] [-x]
+ *   -s  vehicle profile (default robot; rover = real Raspberry Pi rover)
+ *   -x  real rover: vehicle_link owns the motor relay, the supervisor only forces it open
+ *       if vehicle_link disappears
  *   -b  bench mode: car on a stand, yaw voting off
  *   -c  pin the supervisor to one CPU core (Raspberry Pi 5 has 4)
  *   -v  verbose: print every event and GPIO change
@@ -47,6 +51,7 @@ static qnx_server_t  g_srv;
 static sup_output_t g_out;
 static av_ring_t  *g_ring;
 static int          g_verbose;
+static int          g_relay_external;   /* -x: the rover's vehicle_link owns the motor relay */
 
 /* ------------------------------------------------------------------ */
 
@@ -60,8 +65,8 @@ static void on_event(void *user, const av_event_t *ev)
     (void)user;
     if (g_ring)
         ring_push(g_ring, ev);
-    if (!g_verbose || ev->kind == EV_CYCLE)
-        return;
+    if (ev->kind == EV_CYCLE || (!g_verbose && ev->kind != EV_DEADLINE))
+        return;                                            /* deadline results are always shown */
 
     char buf[256];
     switch (ev->kind) {
@@ -82,6 +87,12 @@ static void on_event(void *user, const av_event_t *ev)
     case EV_CLIENT:
         printf("[SUPERVISOR] nav %s (pid %u)\n", ev->x1 > 0.5f ? "connected" : "DISCONNECTED", ev->aux);
         break;
+    case EV_DEADLINE:
+        printf("[SUPERVISOR] stop deadline %s  %.0f ms / %.0f ms\n",
+               ev->aux == DL_START ? "STARTED" : ev->aux == DL_PASS ? "PASS" :
+               ev->aux == DL_FAIL ? "FAIL" : "MISSED", ev->aux == DL_START ? 0.0f : ev->x1,
+               ev->aux == DL_START ? ev->x1 : ev->x2);
+        break;
     default:
         break;
     }
@@ -97,15 +108,27 @@ static void update_gpio(void)
     gpio_set(AV_GPIO_GREEN, green);
     gpio_set(AV_GPIO_RED, red);
     gpio_set(AV_GPIO_BUZZER, s == ST_MRM || s == ST_ESTOP);
-    gpio_set(AV_GPIO_SAFE_REQ, red);
+    gpio_set(AV_GPIO_INJECT, g_ctx.inject_t_us != 0);         /* high until the first reaction */
+    if (!g_relay_external)
+        gpio_set(AV_GPIO_MOTOR_RELAY, g_ctx.out.motor_enable);    /* low = motor power cut */
 }
 
 static void send_output(uint64_t now, uint64_t t_in_cycles)
 {
+    static int link_was_up;
     g_ctx.out.seq++;
     g_ctx.out.t_us = now;
     int ok = out_send_vehicle(&g_out, &g_ctx.out);
     sup_core_on_output_result(&g_ctx, ok);
+    /* rover: if vehicle_link itself dies, its PWM could keep running - cut the motor power */
+    if (g_relay_external) {
+        int up = g_out.link_coid != -1;
+        if (link_was_up && !up) {
+            gpio_force(AV_GPIO_MOTOR_RELAY, 0);
+            printf("[SUPERVISOR] vehicle link LOST -> motor relay forced OPEN\n");
+        }
+        link_was_up = up;
+    }
     update_gpio();
     if (t_in_cycles)
         stats_out_latency(&g_ctx.stats, (float)qnx_cycles_to_us(qnx_cycles() - t_in_cycles));
@@ -123,6 +146,8 @@ static void do_actions(uint64_t now, uint64_t t_in_cycles)
         out_pulse_recovery(&g_out, AV_PULSE_RECOV_STOP, 0);
     if (a & ACT_RESTART_NAV)
         out_pulse_recovery(&g_out, AV_PULSE_RESTART_NAV, g_ctx.nav_pid);
+    if (a & ACT_RESTART_SENSOR)
+        out_pulse_recovery(&g_out, AV_PULSE_RESTART_SENSOR, 0);
     if (a & ACT_LOG_KICK)
         out_pulse_logger(&g_out);
 }
@@ -170,6 +195,11 @@ static void on_pulse(const struct _pulse *p, uint64_t now)
         ConnectDetach(p->scoid);
         if (roles & AV_ROLE_NAV)
             sup_core_on_nav_disconnect(&g_ctx, now);
+        if (roles & AV_ROLE_SENSOR) {
+            /* no more sensor frames: the watchdog reports SENSOR_LINK_LOST within 30 ms */
+            printf("[SUPERVISOR] SENSOR MONITOR died (pid %d) -> asking recovery to restart it\n", pid);
+            g_ctx.actions |= ACT_RESTART_SENSOR;
+        }
         if (roles)
             printf("[SUPERVISOR] client '%s' (pid %d) disconnected\n", name, pid);
         do_actions(now, 0);
@@ -273,6 +303,7 @@ static void on_message(int rcvid, sup_msg_t *m, const struct _msg_info *info, ui
             stats_init(&g_ctx.stats);
         sup_core_fill_status(&g_ctx, &st);
         st.ack_result = (uint8_t)ack;
+        st.sensor_pid = access_role_pid(&g_roles, AV_ROLE_SENSOR);
         MsgReply(rcvid, EOK, &st, sizeof st);
         break;
     }
@@ -289,14 +320,15 @@ int main(int argc, char *argv[])
     const char *profile = "robot";
     int bench = 0, core = -1, opt;
 
-    while ((opt = getopt(argc, argv, "s:bc:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "s:bc:vxh")) != -1) {
         switch (opt) {
         case 's': profile = optarg; break;
         case 'b': bench = 1; break;
         case 'c': core = atoi(optarg); break;
         case 'v': g_verbose = 1; break;
+        case 'x': g_relay_external = 1; break;
         default:
-            fprintf(stderr, "usage: %s [-s robot|car] [-b] [-c core] [-v]\n", argv[0]);
+            fprintf(stderr, "usage: %s [-s robot|rover|car] [-b] [-c core] [-v] [-x]\n", argv[0]);
             return 1;
         }
     }
@@ -309,7 +341,7 @@ int main(int argc, char *argv[])
     g_ring = ring_open();
     access_init(&g_roles);
     out_init(&g_out);
-    gpio_init(g_verbose);
+    gpio_init(g_verbose, g_relay_external);
     sup_core_init(&g_ctx, P, bench, on_event, NULL, qnx_now_us());
 
     if (qnx_server_create(&g_srv, AV_NAME_SUPERVISOR, 1) == -1)

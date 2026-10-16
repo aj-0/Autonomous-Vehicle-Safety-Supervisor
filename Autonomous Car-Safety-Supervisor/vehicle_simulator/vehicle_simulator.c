@@ -6,8 +6,9 @@
  *
  *  server thread  : VEHICLE_CMD from the supervisor (only the SUPERVISOR role may drive),
  *                   SIM_CTRL from the CLI (faults, obstacle, reset, E-stop)
- *  physics thread : 100 Hz vehicle dynamics, sensors with noise, sensor health, island
- *                   watchdog, sends SENSOR_STATE + PERCEPTION (camera model) every cycle
+ *  physics thread : 100 Hz vehicle dynamics, sensors with noise, island watchdog;
+ *                   sends RAW_SENSORS to the sensor monitor (which judges sensor health) and
+ *                   PERCEPTION (camera model) to the supervisor and navigation
  *
  * usage: vehicle_simulator [-s robot|car] [-v]
  */
@@ -22,7 +23,6 @@
 
 #include "qnx_helpers.h"
 #include "access_control.h"
-#include "sensor_health.h"
 #include "settings.h"
 #include "vehicle_physics.h"
 
@@ -55,10 +55,10 @@ typedef struct {
     uint32_t faults;
     float    frozen_gyro, frozen_ax, frozen_ay;
 
-    /* sensors */
-    health_tracker_t tr[SENS_COUNT];
+    /* sensors (raw values only: the sensor monitor judges their health) */
     float    enc_l, enc_r, dist, gyro, ax, ay;
     int      no_echo;
+    uint8_t  fresh;                      /* SENS_* bits: new sample in this cycle */
     uint32_t sens_seq, tick;
 
     /* camera */
@@ -158,17 +158,17 @@ static void step_vehicle(uint64_t now, double dt)
     }
 
     /* ---- sensors ---- */
-    int moving = fabs(v) > 2.0 * P->standstill_v;
+    S.fresh = 0;
     S.ax = (float)((v - S.v_prev) / dt);
     S.ay = (float)(v * omega);
     S.v_prev = v;
 
     if (!(S.faults & FBIT(FAULT_ENC_L_DEAD))) {
         S.enc_l = (float)(S.vl + P->enc_noise * gauss());
-        health_sample(&S.tr[SENS_ENC_L], S.enc_l, now, moving);
+        S.fresh |= 1u << SENS_ENC_L;
     }
     S.enc_r = (float)(S.vr + P->enc_noise * gauss());
-    health_sample(&S.tr[SENS_ENC_R], S.enc_r, now, moving);
+    S.fresh |= 1u << SENS_ENC_R;
 
     if (!(S.faults & FBIT(FAULT_IMU_DEAD))) {
         if (S.faults & FBIT(FAULT_IMU_FROZEN)) {
@@ -178,7 +178,7 @@ static void step_vehicle(uint64_t now, double dt)
         } else {
             S.gyro = (float)(omega * RAD2DEG + P->gyro_noise_dps * gauss());
         }
-        health_sample(&S.tr[SENS_IMU], S.gyro, now, moving);
+        S.fresh |= 1u << SENS_IMU;
     }
 
     if ((S.tick % AV_US_EVERY_TICKS) == 0 && !(S.faults & FBIT(FAULT_US_DEAD))) {
@@ -187,16 +187,14 @@ static void step_vehicle(uint64_t now, double dt)
                       fabs(S.y) < P->lane_half_m && fabs(S.psi) < 0.26;
         S.no_echo = !visible;
         S.dist = visible ? (float)(rel + P->us_noise * gauss()) : P->us_max_m;
-        health_sample(&S.tr[SENS_US], S.dist, now, moving && visible);
+        S.fresh |= 1u << SENS_US;
     }
-    for (int i = 0; i < SENS_COUNT; i++)
-        health_poll(&S.tr[i], now);
 }
 
-static void make_sensor_msg(av_sensor_state_t *m, uint64_t now)
+static void make_sensor_msg(av_raw_sensors_t *m, uint64_t now)
 {
     memset(m, 0, sizeof *m);
-    m->hdr.type = AV_MSG_SENSOR_STATE;
+    m->hdr.type = AV_MSG_RAW_SENSORS;
     m->hdr.version = AV_PROTO_VERSION;
     m->seq = ++S.sens_seq;
     m->t_us = now;
@@ -206,8 +204,7 @@ static void make_sensor_msg(av_sensor_state_t *m, uint64_t now)
     m->gyro_z_dps = S.gyro;
     m->accel_x = S.ax;
     m->accel_y = S.ay;
-    for (int i = 0; i < SENS_COUNT; i++)
-        m->health[i] = S.tr[i].health;
+    m->fresh = S.fresh;
     m->us_no_echo = (uint8_t)S.no_echo;
     m->island_state = S.island == ISL_TRIPPED;
     m->estop = (uint8_t)S.estop;
@@ -277,18 +274,19 @@ static int make_perception(av_perception_t *p, uint64_t now)
     return 1;
 }
 
-static int connect_sup(void)
+/* connect to a server and claim a role there: camera -> supervisor, sensors -> sensor monitor */
+static int connect_as(const char *name, uint32_t role, const char *what)
 {
-    int coid = name_open(AV_NAME_SUPERVISOR, 0);
+    int coid = name_open(name, 0);
     if (coid == -1)
         return -1;
-    int err = qnx_hello(coid, AV_ROLE_SENSOR | AV_ROLE_PERCEPTION, "vehicle_simulator");
+    int err = qnx_hello(coid, role, "vehicle_simulator");
     if (err) {
-        fprintf(stderr, "[SIMULATOR] supervisor refused HELLO: %s\n", strerror(err));
+        fprintf(stderr, "[SIMULATOR] %s refused HELLO: %s\n", name, strerror(err));
         name_close(coid);
         return -1;
     }
-    printf("[SIMULATOR] connected to supervisor\n");
+    printf("[SIMULATOR] connected to %s (%s)\n", name, what);
     return coid;
 }
 
@@ -311,7 +309,7 @@ static void *physics_thread(void *arg)
     int chid = ChannelCreate(0);
     qnx_pulse_timer(chid, AV_PRIO_SIM, AV_PULSE_TICK, AV_TICK_MS * 1000u, NULL);
 
-    int sup = -1, nav = -1;
+    int sup = -1, nav = -1, mon = -1;
     uint64_t next_try = 0, last_print = 0;
 
     for (;;) {
@@ -322,13 +320,15 @@ static void *physics_thread(void *arg)
 
         if (now >= next_try) {
             if (sup == -1)
-                sup = connect_sup();
+                sup = connect_as(AV_NAME_SUPERVISOR, AV_ROLE_PERCEPTION, "camera results");
+            if (mon == -1)
+                mon = connect_as(AV_NAME_SENSOR, AV_ROLE_SENSOR, "raw sensor readings");
             if (nav == -1)
                 nav = name_open(AV_NAME_NAV, 0);
             next_try = now + 1000000u;
         }
 
-        av_sensor_state_t sm;
+        av_raw_sensors_t sm;
         av_perception_t pm;
         int send_perc;
 
@@ -345,8 +345,8 @@ static void *physics_thread(void *arg)
         }
         pthread_mutex_unlock(&S.mtx);
 
-        if (!link_drop)                         /* pulled wire: STM32 frames stop arriving */
-            send_or_drop(&sup, &sm, sizeof sm);
+        if (!link_drop)                         /* pulled wire: sensor frames stop arriving */
+            send_or_drop(&mon, &sm, sizeof sm);
         if (send_perc) {
             send_or_drop(&sup, &pm, sizeof pm);
             send_or_drop(&nav, &pm, sizeof pm);
@@ -448,11 +448,6 @@ int main(int argc, char *argv[])
     S.island = ISL_ARMING;
     S.no_echo = 1;
     S.dist = P->us_max_m;
-
-    health_init(&S.tr[SENS_ENC_L], -1.5f * P->v_max, 1.5f * P->v_max, 3.0f * P->a_phys_max, 50, P->enc_frozen_ms);
-    health_init(&S.tr[SENS_ENC_R], -1.5f * P->v_max, 1.5f * P->v_max, 3.0f * P->a_phys_max, 50, P->enc_frozen_ms);
-    health_init(&S.tr[SENS_US], 0.0f, P->us_max_m + 0.01f, 0.0f, 150, 1000);
-    health_init(&S.tr[SENS_IMU], -P->gyro_max_dps, P->gyro_max_dps, 5000.0f, 50, P->imu_frozen_ms);
 
     qnx_set_priority(AV_PRIO_SIM);
     access_init(&g_roles);

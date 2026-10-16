@@ -51,22 +51,82 @@ extern int av_tscale;
 #define AV_STANDSTILL_HOLD_MS      200
 #define AV_RECOVERY_CLEAR_MS       2000
 
+/* ---- safe-state deadline ----
+ * When the supervisor starts a stop (MRM or ESTOP) at speed v0 with deceleration a, the vehicle
+ * must reach SAFE (standing still, latched) within
+ *     deadline = REACT + MARGIN * v0 / a + STANDSTILL_HOLD
+ * REACT covers command delivery + drivetrain response, MARGIN allows a 25 % slower stop.
+ * A missed deadline escalates to ESTOP and cuts the motor relay. */
+#define AV_DEADLINE_REACT_MS       (100 * av_tscale)
+#define AV_DEADLINE_MARGIN         1.25f
+
 /* ---- priorities (SCHED_FIFO) ---- */
 #define AV_PRIO_SUPERVISOR         50
 #define AV_PRIO_LINK               48
 #define AV_PRIO_RECOVERY           45
 #define AV_PRIO_SIM                40
+#define AV_PRIO_PERCEPTION         35
 #define AV_PRIO_SENSOR             30
 #define AV_PRIO_NAV                10
 #define AV_PRIO_LOGGER             8
 #define AV_PRIO_CLI                5
 
-/* ---- GPIO, BCM numbering on the Raspberry Pi 40-pin header ---- */
+/* ---- GPIO safety outputs, BCM numbering on the Raspberry Pi 40-pin header ----
+ *  GPIO   pin  signal
+ *   17    11   red LED      : stopping / stopped (MRM, ESTOP, SAFE)
+ *   27    13   green LED    : on = NORMAL, blinking = CAUTION / DEGRADED / RECOVERY
+ *   22    15   buzzer       : MRM or ESTOP in progress
+ *   23    16   inject mark  : high from fault injection until the supervisor reacts
+ *                             (scope channel 1 -> measure the override latency in hardware)
+ *   24    18   motor relay  : HIGH = motors may be powered, LOW = motor power cut.
+ *                             An unpowered Pi leaves the pin low (use a pull-down and a relay
+ *                             that is open when not driven). A crashed supervisor process does
+ *                             NOT: the GPIO keeps its last value - that case needs an external
+ *                             dead-man / watchdog (next hardware step). */
 #define AV_GPIO_RED                17
 #define AV_GPIO_GREEN              27
 #define AV_GPIO_BUZZER             22
-#define AV_GPIO_INJECT             23    /* fault-injection marker -> STM32 stopwatch */
-#define AV_GPIO_SAFE_REQ           24    /* supervisor safe request -> STM32          */
+#define AV_GPIO_INJECT             23
+#define AV_GPIO_MOTOR_RELAY        24
+
+/* ---- real rover (vehicle_link on the Raspberry Pi, profile "rover") ----
+ *  GPIO   pin  signal
+ *   12    32   L298N ENA  PWM left motor   (remove the ENA jumper)
+ *   13    33   L298N ENB  PWM right motor  (remove the ENB jumper)
+ *    5    29   L298N IN1  left  forward
+ *    6    31   L298N IN2  left  reverse
+ *   16    36   L298N IN3  right forward
+ *   26    37   L298N IN4  right reverse
+ *   20    38   left  wheel encoder (LM393 module powered from 3.3 V)
+ *   21    40   right wheel encoder
+ *   25    22   E-stop button, normally-closed to GND (open / broken wire = STOP)
+ *   19    35   ACK button, normally-open to GND
+ *   14/15 8/10 TF-Luna RX/TX (UART, 115200), TF-Luna powered from 5 V
+ *   2/3   3/5  MPU6050 SDA/SCL (I2C)
+ * The motor relay (GPIO24) is driven by vehicle_link on the rover. */
+#define AV_GPIO_PWM_LEFT           12
+#define AV_GPIO_PWM_RIGHT          13
+#define AV_GPIO_L_FWD              5
+#define AV_GPIO_L_REV              6
+#define AV_GPIO_R_FWD              16
+#define AV_GPIO_R_REV              26
+#define AV_GPIO_ENC_LEFT           20
+#define AV_GPIO_ENC_RIGHT          21
+#define AV_GPIO_ESTOP_IN           25
+#define AV_GPIO_ACK_IN             19
+
+/* calibration of the real rover - MEASURE THESE on your chassis */
+#define AV_HW_WHEEL_DIAMETER_M     0.065f  /* wheel diameter                            */
+#define AV_HW_ENCODER_SLOTS        20      /* slots on the encoder disc = pulses / turn  */
+#define AV_HW_ENC_WINDOW_US        250000  /* speed is averaged over 250 ms of pulses    */
+#define AV_HW_ENC_MIN_GAP_US       2000    /* edges closer than 2 ms are bounce          */
+#define AV_HW_MOTOR_V_FULL         0.90f   /* m/s at 100 % PWM on the floor              */
+#define AV_HW_MOTOR_MIN_DUTY       0.30f   /* below this duty the wheels do not turn     */
+#define AV_HW_SPEED_KP             0.60f   /* extra duty per m/s of speed error          */
+#define AV_HW_PWM_HZ               1000
+#define AV_HW_PWM_RANGE            1024
+#define AV_HW_LIDAR_MIN_AMP        100     /* TF-Luna signal below this is unreliable    */
+#define AV_HW_LIDAR_BAUD           115200
 
 typedef struct {
     const char *name;
@@ -98,7 +158,8 @@ typedef struct {
     float enc_noise, us_noise, gyro_noise_dps;
 } av_profile_t;
 
-const av_profile_t *av_profile_get(const char *name);   /* "robot" (default) or "car"; also reads AV_TIMESCALE */
+/* "robot" (default, simulated scale car), "rover" (real Pi rover) or "car"; also reads AV_TIMESCALE */
+const av_profile_t *av_profile_get(const char *name);
 
 const char *av_state_name(int s);
 const char *av_verdict_name(int v);

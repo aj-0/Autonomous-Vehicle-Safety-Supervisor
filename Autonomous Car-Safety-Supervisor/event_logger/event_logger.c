@@ -55,6 +55,7 @@ static const char *kind_name(const av_event_t *e)
     case EV_REACTION: return "REACTION";
     case EV_CLIENT:   return "NAVIGATION";
     case EV_OVERRUN:  return "SLOW CYCLE";
+    case EV_DEADLINE: return "DEADLINE";
     default:          return "INFO";
     }
 }
@@ -117,6 +118,28 @@ static void describe(const av_event_t *e, char *out, int len)
         snprintf(out, (size_t)len, "one supervisor cycle took %.0f us (budget %d us)", e->x1,
                  AV_OVERRUN_US);
         break;
+    case EV_DEADLINE:
+        switch (e->aux) {
+        case DL_START:
+            snprintf(out, (size_t)len,
+                     "stop started at %.2f m/s, braking %.1f m/s^2 -> must be standing still within %.0f ms",
+                     e->v, e->x2, e->x1);
+            break;
+        case DL_PASS:
+            snprintf(out, (size_t)len, "PASS: safe state reached in %.0f ms (deadline %.0f ms, %.0f ms to spare)",
+                     e->x1, e->x2, e->x2 - e->x1);
+            break;
+        case DL_FAIL:
+            snprintf(out, (size_t)len, "FAIL: safe state reached only after %.0f ms (deadline %.0f ms)",
+                     e->x1, e->x2);
+            break;
+        default:
+            snprintf(out, (size_t)len,
+                     "MISSED: still moving after %.0f ms (deadline %.0f ms) -> emergency stop, motor power cut",
+                     e->x1, e->x2);
+            break;
+        }
+        break;
     case EV_CYCLE:
         snprintf(out, (size_t)len,
                  "state %s | who drives: %s | nav asks %.2f m/s, steer %.1f deg | problems: %s",
@@ -136,7 +159,7 @@ static void print_event(const av_event_t *e)
     printf("%8.2f s  %-10s %s\n", secs(e), kind_name(e), text);
     /* show the measured values with the events where they matter */
     if (e->kind == EV_CYCLE || e->kind == EV_VERDICT || e->kind == EV_STATE ||
-        (e->kind == EV_COND && e->x1 > 0.5f))
+        e->kind == EV_DEADLINE || (e->kind == EV_COND && e->x1 > 0.5f))
         printf("%8s    %-10s %s\n", "", "", vals);
 }
 
@@ -222,7 +245,8 @@ static void handle(const av_event_t *e)
     }
 
     int trigger = (e->kind == EV_STATE && (e->state == ST_MRM || e->state == ST_ESTOP)) ||
-                  (e->kind == EV_VERDICT && e->verdict == V_REJECT);
+                  (e->kind == EV_VERDICT && e->verdict == V_REJECT) ||
+                  (e->kind == EV_DEADLINE && e->aux == DL_MISSED);
     if (trigger && !g_inc)
         open_incident(e);
 }
@@ -292,6 +316,7 @@ int main(int argc, char *argv[])
     printf("   PROBLEM    = supervisor detected a problem   SOLVED    = problem gone\n");
     printf("   CORRECTED  = nav command made safer (CLAMP)  BLOCKED   = nav command refused (REJECT)\n");
     printf("   STATE      = safety level changed            REACTION  = time from fault to reaction\n");
+    printf("   DEADLINE   = stop must end within a time limit: started / PASS / FAIL / MISSED\n");
     printf("--------------------------------------------------------------------------------------\n");
     fflush(stdout);
 

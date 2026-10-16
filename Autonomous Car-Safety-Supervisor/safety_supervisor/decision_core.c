@@ -11,6 +11,7 @@
 #include "checks.h"
 #include "watchdog.h"
 #include "safety_states.h"
+#include "safety_deadline.h"
 #include "final_command.h"
 
 /* ------------------------------------------------------------------ */
@@ -135,6 +136,10 @@ void sup_core_on_sensor(sup_ctx_t *c, const av_sensor_state_t *s, uint64_t now)
     c->sens = *s;
     c->sens_rx_us = now;
     c->sens_seen = 1;
+    /* physical ACK button = the operator's "ack" (only acts in RECOVERY, like the CLI) */
+    if (s->ack_button && !c->ack_btn_prev && c->state == ST_RECOVERY)
+        c->ack_pending = 1;
+    c->ack_btn_prev = s->ack_button;
     chk_input_on_sensor(c, now);
     chk_situation_on_sensor(c);
     evaluate(c, now, 1);
@@ -242,6 +247,7 @@ void sup_core_tick(sup_ctx_t *c, uint64_t now)
 {
     c->now_us = now;
     wd_tick(c, now);
+    dl_tick(c, now);
     if (c->inject_t_us && now - c->inject_t_us > (uint64_t)AV_INJECT_WINDOW_MS * 1000u)
         c->inject_t_us = 0;                         /* no reaction: fault had no effect */
     evaluate(c, now, 0);
@@ -304,4 +310,11 @@ void sup_core_fill_status(const sup_ctx_t *c, av_status_t *st)
     st->inject_count = c->stats.inj_n;
     st->last_inject_fault = c->last_inject_fault;
     st->uptime_ms = (uint32_t)((now - c->start_us) / 1000u);
+    st->dl_active = (uint8_t)c->dl_active;
+    st->dl_budget_ms = c->dl_budget_ms;
+    st->dl_elapsed_ms = c->dl_last_ms;
+    st->dl_pass = c->dl_pass_n;
+    st->dl_fail = c->dl_fail_n;
+    st->dl_worst_ms = c->dl_worst_ms;
+    st->dl_min_margin_ms = c->dl_min_margin_ms;
 }

@@ -2,6 +2,9 @@
 #
 #   make                 Raspberry Pi 5 / Pi 4 (QNX aarch64le)   -> build/aarch64le/
 #   make ARCH=x86_64     QNX x86_64 virtual machine              -> build/x86_64/
+#   make GPIO=rpi        Pi build that drives the real GPIO pins -> build/aarch64le-gpio/
+#                        + vehicle_link (real rover: L298N, encoders, TF-Luna, buttons)
+#                        (needs QNX's <sys/rpi_gpio.h>, see README)
 #   make test            host unit tests of the decision logic (gcc, no QNX needed)
 #   make clean
 #
@@ -15,26 +18,41 @@ else
 endif
 
 CC      := qcc -V$(QCCV)
-CFLAGS  := -std=gnu11 -O2 -g -Wall -Wextra -Ishared -Isafety_supervisor $(EXTRA_CFLAGS)
+ifeq ($(GPIO),rpi)
+  GPIO_FLAGS := -DAV_GPIO_RPI
+  OUT_SUFFIX := -gpio
+  HW_PROGRAMS := vehicle_link
+endif
+
+CFLAGS  := -std=gnu11 -O2 -g -Wall -Wextra -Ishared -Isafety_supervisor $(GPIO_FLAGS) $(EXTRA_CFLAGS)
 LDLIBS  := -lm
-OUT     := build/$(ARCH)
+OUT     := build/$(ARCH)$(OUT_SUFFIX)
 HOSTCC  ?= gcc
 
 HDRS        := $(wildcard shared/*.h safety_supervisor/*.h)
-SHARED      := shared/settings.c shared/vehicle_physics.c shared/sensor_health.c
+SHARED      := shared/settings.c shared/vehicle_physics.c shared/sensor_health.c shared/hw_protocols.c
 SHARED_QNX  := shared/qnx_helpers.c shared/event_buffer.c shared/access_control.c
-DECISION    := safety_supervisor/decision_core.c safety_supervisor/check_sensors.c                safety_supervisor/check_nav_command.c safety_supervisor/check_obstacle_camera.c                safety_supervisor/watchdog.c safety_supervisor/safety_states.c                safety_supervisor/final_command.c safety_supervisor/timing_stats.c
+DECISION    := safety_supervisor/decision_core.c safety_supervisor/check_sensors.c                safety_supervisor/check_nav_command.c safety_supervisor/check_obstacle_camera.c                safety_supervisor/watchdog.c safety_supervisor/safety_states.c safety_supervisor/safety_deadline.c                safety_supervisor/final_command.c safety_supervisor/timing_stats.c
 SUP_QNX     := safety_supervisor/supervisor_main.c safety_supervisor/send_output.c                safety_supervisor/leds_buzzer.c
 
-PROGRAMS := safety_supervisor vehicle_simulator navigation recovery_manager event_logger             operator_cli cpu_stress
+PROGRAMS := safety_supervisor sensor_monitor vehicle_simulator navigation recovery_manager event_logger             operator_cli cpu_stress perception_gateway $(HW_PROGRAMS)
 
-all: $(addprefix $(OUT)/,$(PROGRAMS)) $(OUT)/start_all.sh $(OUT)/stop_all.sh
+all: $(addprefix $(OUT)/,$(PROGRAMS)) $(OUT)/start_all.sh $(OUT)/stop_all.sh $(OUT)/start_rover.sh
 
 $(OUT):
 	mkdir -p $@
 
 $(OUT)/safety_supervisor: $(SUP_QNX) $(DECISION) $(SHARED) $(SHARED_QNX) $(HDRS) | $(OUT)
 	$(CC) $(CFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+$(OUT)/sensor_monitor: sensor_monitor/sensor_monitor.c sensor_monitor/imu_mpu6050.c $(SHARED) $(SHARED_QNX) $(HDRS) sensor_monitor/imu_mpu6050.h | $(OUT)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+$(OUT)/vehicle_link: vehicle_link/vehicle_link.c vehicle_link/pi_gpio.c $(SHARED) $(SHARED_QNX) $(HDRS) vehicle_link/pi_gpio.h | $(OUT)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS)
+
+$(OUT)/perception_gateway: perception_gateway/perception_gateway.c $(SHARED) $(SHARED_QNX) $(HDRS) | $(OUT)
+	$(CC) $(CFLAGS) -o $@ $(filter %.c,$^) $(LDLIBS) -lsocket
 
 $(OUT)/cpu_stress: tools/cpu_stress.c | $(OUT)
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)

@@ -51,8 +51,10 @@ void arb_compute(sup_ctx_t *c, uint64_t now)
         speed = 0.0f;
         steer = 0.0f;
         brake = BRAKE_MAX;
-        /* ESTOP keeps the motor driver powered for active braking, unless braking itself failed */
-        enable = (c->state == ST_ESTOP && !(c->conds & CBIT(C_BRAKE_INEFFECTIVE))) ? 1 : 0;
+        /* ESTOP keeps the motor driver powered for active braking, unless braking itself failed
+         * or the stop already missed its deadline: then the motor relay is cut */
+        enable = (c->state == ST_ESTOP &&
+                  !(c->conds & (CBIT(C_BRAKE_INEFFECTIVE) | CBIT(C_DEADLINE_MISSED)))) ? 1 : 0;
         break;
     }
 

@@ -77,7 +77,8 @@ static void plan_and_send(void)
     MsgSendPulse(g_sup, -1, AV_PULSE_NAV_HB, (int)g_seq);
 
     int fresh = g_perc_rx && now - g_perc_rx < 200000u;
-    float v_est = fresh ? g_perc.odom_speed : g_last.out_speed;
+    /* speed estimate: camera odometry if it has one (the real Jetson does not: -1) */
+    float v_est = fresh && g_perc.odom_speed >= 0.0f ? g_perc.odom_speed : g_last.out_speed;
     float speed = 0.0f, target_steer = 0.0f;
     uint8_t obstacle = 0, zone = ZONE_NONE;
 
@@ -174,7 +175,9 @@ int main(int argc, char *argv[])
     qnx_set_priority(AV_PRIO_NAV);
 
     qnx_server_t srv;
-    if (qnx_server_create(&srv, AV_NAME_NAV, 0) == -1)
+    /* fixed priority: camera messages from the simulator (prio 40) must not lift navigation
+     * above its own priority 10 - navigation always stays the lowest control task */
+    if (qnx_server_create(&srv, AV_NAME_NAV, 1) == -1)
         return 1;
     connect_supervisor();
     qnx_pulse_timer(srv.chid, AV_PRIO_NAV, AV_PULSE_TICK, AV_NAV_PERIOD_MS * 1000u, NULL);

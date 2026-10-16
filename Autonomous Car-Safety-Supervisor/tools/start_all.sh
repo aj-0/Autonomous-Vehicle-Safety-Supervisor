@@ -13,7 +13,7 @@
 #   safety_events.csv    every safety event (open in Excel)
 #   live_values.csv      speed, distance, commands every 10 ms
 #   incident_001.csv     black box: 0.5 s before + 1 s after each emergency
-#   *.out                console output of each program
+#   *.out                console output of each program (sensor_monitor.out: sensor health changes)
 #
 # Control:  ./operator_cli     (then: start, status, inject slew, obstacle 2 unknown, ...)
 
@@ -32,15 +32,16 @@ mkdir -p $LOG
 "$DIR/event_logger"      -d $LOG                             > $LOG/safety_log.txt  2>&1 &
 sleep 1
 "$DIR/vehicle_simulator" -s $PROFILE                         > $LOG/simulator.out   2>&1 &
-"$DIR/recovery_manager"  -s $PROFILE -n "$DIR/navigation"    > $LOG/recovery.out    2>&1 &
+"$DIR/recovery_manager"  -s $PROFILE -n "$DIR/navigation" -m "$DIR/sensor_monitor" > $LOG/recovery.out 2>&1 &
 "$DIR/safety_supervisor" -s $PROFILE $BENCH                  > $LOG/supervisor.out  2>&1 &
 sleep 1
+"$DIR/sensor_monitor"    -s $PROFILE                         > $LOG/sensor_monitor.out 2>&1 &
 "$DIR/navigation"        -s $PROFILE                         > $LOG/navigation.out  2>&1 &
 sleep 1
 
 echo "AV Safety Supervisor running (profile $PROFILE, timescale x${AV_TIMESCALE:-1})"
 echo "Programs (pid, thread, name, priority, state):"
-pidin | grep -E "safety_super|vehicle_simul|navigation|recovery_man|event_logger"
+pidin | grep -E "safety_super|sensor_monit|vehicle_simul|navigation|recovery_man|event_logger"
 echo
 echo "Next:  $DIR/operator_cli                  (then: start, status, inject slew, ...)"
 echo "Log:   tail -f $LOG/safety_log.txt"

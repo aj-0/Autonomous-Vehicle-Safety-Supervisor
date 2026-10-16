@@ -24,6 +24,7 @@
 #define AV_NAME_RECOVERY   "av_recovery"
 #define AV_NAME_LOGGER     "av_logger"
 #define AV_NAME_NAV        "av_navigation"
+#define AV_NAME_SENSOR     "av_sensor_monitor"
 
 #define AV_PROTO_VERSION 1
 
@@ -36,6 +37,8 @@
 #define AV_PULSE_RECOV_START  (_PULSE_CODE_MINAVAIL + 4)  /* value = start speed in mm/s       */
 #define AV_PULSE_RECOV_STOP   (_PULSE_CODE_MINAVAIL + 5)
 #define AV_PULSE_RESTART_NAV  (_PULSE_CODE_MINAVAIL + 6)  /* value = pid of old nav (0 = none) */
+#define AV_PULSE_RESTART_SENSOR (_PULSE_CODE_MINAVAIL + 7) /* sensor monitor died: start a new one */
+#define AV_PULSE_GPIO_EDGE    (_PULSE_CODE_MINAVAIL + 8)  /* GPIO edge event, value = pin number */
 
 /* ------------------------------------------------------------------ */
 /* Message types - well above the QNX reserved I/O range (0x000-0x1FF) */
@@ -51,6 +54,7 @@ enum {
     AV_MSG_VEHICLE_CMD,
     AV_MSG_NAV_CTRL,
     AV_MSG_SIM_CTRL,
+    AV_MSG_RAW_SENSORS,
 };
 
 typedef struct {
@@ -139,6 +143,7 @@ enum {
     C_ISLAND_TRIPPED,       /* STM32 safety island stopped the vehicle itself   */
     C_ESTOP_BUTTON,
     C_PATH_BLOCKED,         /* obstacle too close to allow recovery             */
+    C_DEADLINE_MISSED,      /* not stopped within the safe-state deadline       */
     C__COUNT
 };
 #define CBIT(c) (1u << (c))
@@ -201,7 +206,26 @@ typedef struct {
     float     steer_deg;
 } av_recovery_cmd_t;
 
-/* sensor_monitor (or vehicle_simulator) -> supervisor, every 10 ms */
+/* vehicle link / vehicle_simulator -> sensor_monitor, every 10 ms: raw readings, not yet checked.
+ * fresh: bit SENS_* set = this sensor delivered a new sample in this frame. */
+typedef struct {
+    av_hdr_t hdr;              /* AV_MSG_RAW_SENSORS */
+    uint32_t  seq;
+    uint64_t  t_us;
+    float     v_left, v_right;
+    float     distance_m;
+    float     gyro_z_dps;
+    float     accel_x, accel_y;
+    uint8_t   fresh;
+    uint8_t   us_no_echo;
+    uint8_t   island_state;
+    uint8_t   estop;
+    uint8_t   relay_closed;
+    uint8_t   ack_button;        /* operator ACK button pressed          */
+    uint8_t   pad[2];
+} av_raw_sensors_t;
+
+/* sensor_monitor -> supervisor, every 10 ms: readings + health verdict of every sensor */
 typedef struct {
     av_hdr_t hdr;              /* AV_MSG_SENSOR_STATE */
     uint32_t  seq;
@@ -216,8 +240,9 @@ typedef struct {
     uint8_t   estop;            /* E-stop button pressed            */
     uint8_t   relay_closed;
     uint16_t  link_errors;
-    uint16_t  pad;
-    uint32_t  hw_latency_us;    /* STM32 hardware stopwatch         */
+    uint8_t   ack_button;       /* operator ACK button pressed      */
+    uint8_t   pad;
+    uint32_t  hw_latency_us;    /* hardware stopwatch (unused)      */
 } av_sensor_state_t;
 
 /* perception gateway (or vehicle_simulator) -> supervisor and nav, ~30 Hz */
@@ -282,6 +307,15 @@ typedef struct {
     uint32_t inject_count, last_inject_fault;
     uint32_t uptime_ms;
     float    nav_speed, nav_steer;  /* last command asked by navigation (before the check) */
+    /* sensor monitor task */
+    int32_t  sensor_pid;            /* 0 = not connected */
+    /* safe-state deadline */
+    uint8_t  dl_active, pad2[3];
+    float    dl_budget_ms;          /* running (dl_active) or last deadline */
+    float    dl_elapsed_ms;         /* time used so far / at the end        */
+    uint32_t dl_pass, dl_fail;
+    float    dl_worst_ms;           /* slowest stop seen                    */
+    float    dl_min_margin_ms;      /* smallest (deadline - time used)      */
 } av_status_t;
 
 /* CLI -> nav_task */
@@ -323,7 +357,10 @@ enum {
     EV_CLIENT,         /* client connect (x1 = 1) / disconnect (x1 = 0)      */
     EV_INFO,
     EV_OVERRUN,        /* supervisor cycle exceeded its budget, x1 = us      */
+    EV_DEADLINE,       /* safe-state deadline, aux = DL_*, x1 = ms used, x2 = deadline ms */
 };
+
+enum { DL_START = 0, DL_PASS, DL_FAIL, DL_MISSED };
 
 typedef struct {
     uint64_t t_us;

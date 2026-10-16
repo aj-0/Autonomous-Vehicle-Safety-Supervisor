@@ -19,6 +19,7 @@
 #define ACT_RECOV_STOP   (1u << 2)
 #define ACT_RESTART_NAV  (1u << 3)
 #define ACT_LOG_KICK     (1u << 4)
+#define ACT_RESTART_SENSOR (1u << 5) /* sensor monitor died: recovery starts a new one */
 
 #define SUP_HIST 8
 
@@ -71,11 +72,20 @@ typedef struct sup_ctx {
     float    brake_v0;
     uint64_t brake_t0;
 
+    /* ---- safe-state deadline (safety_deadline.c) ---- */
+    int      dl_active, dl_missed;
+    uint64_t dl_t0_us, dl_end_us;    /* stop started, stop must be done by       */
+    float    dl_budget_ms;
+    float    dl_last_ms;             /* time used by the running / last stop     */
+    uint32_t dl_pass_n, dl_fail_n;
+    float    dl_worst_ms, dl_min_margin_ms;
+
     /* ---- conditions and state machine ---- */
     uint32_t conds, conds_logged;
     av_state_t state;
     uint64_t state_since_us, lower_since_us, clear_since_us, standstill_since_us;
     int      ack_pending;
+    int      ack_btn_prev;           /* physical ACK button (rover): act on the press edge */
     uint8_t  authority;
 
     /* ---- output ---- */
